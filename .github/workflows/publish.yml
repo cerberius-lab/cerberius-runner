@@ -1,0 +1,153 @@
+name: Publish
+
+# Builds the runner, its Helm chart and the agent from Cerberius Agents' source (a private
+# repository) at one release, and publishes them here, public:
+#
+#   ghcr.io/cerberius-lab/cerberius-runner:<runner version>
+#   oci://ghcr.io/cerberius-lab/helm/cerberius-runner   (chart version)
+#   ghcr.io/cerberius-lab/cerberius-agent:<release>
+#
+# Each release of Cerberius Agents writes its tag into RELEASE, which starts this job. What is
+# already published is left alone, so running it again is harmless. The source is read with a
+# read-only deploy key (secret ALION_SUPPORT_DEPLOY_KEY); nothing from it is printed.
+
+on:
+  push:
+    branches: [main]
+    paths: [RELEASE, .github/workflows/publish.yml]
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Release to publish, e.g. v0.0.179. Empty: the one in RELEASE."
+        required: false
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+env:
+  OWNER: cerberius-lab
+  SOURCE_LABEL: https://github.com/cerberius-lab/cerberius-runner
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Which release
+        id: release
+        env:
+          REQUESTED: ${{ inputs.release }}
+        run: |
+          set -eu
+          release="${REQUESTED:-}"
+          if [ -z "$release" ] && [ -f RELEASE ]; then release="$(tr -d '[:space:]' < RELEASE)"; fi
+          if ! printf '%s' "$release" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::notice::Nothing to publish: no release given, or it isn't like v1.2.3."
+            release=""
+          fi
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+
+      - name: Get the source at that release
+        if: steps.release.outputs.release != ''
+        uses: actions/checkout@v4
+        with:
+          repository: cerberius-lab/alion-support
+          ref: ${{ steps.release.outputs.release }}
+          ssh-key: ${{ secrets.ALION_SUPPORT_DEPLOY_KEY }}
+          path: source
+          persist-credentials: false
+
+      - name: Log in to GitHub Container Registry
+        if: steps.release.outputs.release != ''
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: azure/setup-helm@v4
+        if: steps.release.outputs.release != ''
+
+      - name: What to publish
+        id: what
+        if: steps.release.outputs.release != ''
+        env:
+          RELEASE: ${{ steps.release.outputs.release }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          printf '%s' "$TOKEN" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin >/dev/null
+          runner="$(sed -n 's/^version = "\(.*\)"/\1/p' source/runner/pyproject.toml)"
+          chart="$(sed -n 's/^version: //p' source/deploy/runner/chart/Chart.yaml)"
+          echo "runner_version=$runner" >> "$GITHUB_OUTPUT"
+          echo "chart_version=$chart" >> "$GITHUB_OUTPUT"
+
+          # Releases from before the public packages name the old, private images: never
+          # publish a chart or a runner that points there.
+          public=true
+          grep -q "repository: ghcr.io/$OWNER/cerberius-runner" source/deploy/runner/chart/values.yaml || public=false
+          grep -q "image: ghcr.io/$OWNER/cerberius-runner:" source/runner/cerberius_runner/docker-compose.yml || public=false
+
+          has() { docker manifest inspect "$1" >/dev/null 2>&1; }
+          agent=true; has "ghcr.io/$OWNER/cerberius-agent:$RELEASE" && agent=false
+          image=$public; has "ghcr.io/$OWNER/cerberius-runner:$runner" && image=false
+          helm_chart=$public
+          helm show chart "oci://ghcr.io/$OWNER/helm/cerberius-runner" --version "$chart" >/dev/null 2>&1 && helm_chart=false
+          [ "$public" = true ] || echo "::notice::$RELEASE names the old runner image; publishing only the agent."
+
+          echo "agent=$agent" >> "$GITHUB_OUTPUT"
+          echo "runner=$image" >> "$GITHUB_OUTPUT"
+          echo "chart=$helm_chart" >> "$GITHUB_OUTPUT"
+          echo "Release $RELEASE: agent $agent, runner $runner $image, chart $chart $helm_chart (true = to publish)"
+
+      - uses: docker/setup-buildx-action@v3
+        if: steps.what.outputs.agent == 'true' || steps.what.outputs.runner == 'true'
+
+      - name: Publish the agent
+        if: steps.what.outputs.agent == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ./source/agent
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: ghcr.io/${{ env.OWNER }}/cerberius-agent:${{ steps.release.outputs.release }}
+          labels: |
+            org.opencontainers.image.source=${{ env.SOURCE_LABEL }}
+            org.opencontainers.image.title=Cerberius agent
+            org.opencontainers.image.description=The Cerberius Agents support agent, started by a Cerberius runner for each ticket.
+            org.opencontainers.image.version=${{ steps.release.outputs.release }}
+
+      - name: Publish the runner
+        if: steps.what.outputs.runner == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ./source/runner
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: ghcr.io/${{ env.OWNER }}/cerberius-runner:${{ steps.what.outputs.runner_version }}
+          labels: |
+            org.opencontainers.image.source=${{ env.SOURCE_LABEL }}
+            org.opencontainers.image.title=Cerberius runner
+            org.opencontainers.image.description=Runs the Cerberius Agents support agent on your own Kubernetes cluster or server.
+            org.opencontainers.image.version=${{ steps.what.outputs.runner_version }}
+
+      - name: Publish the Helm chart
+        if: steps.what.outputs.chart == 'true'
+        run: |
+          set -eu
+          helm package source/deploy/runner/chart -d dist >/dev/null
+          helm push "dist/cerberius-runner-${{ steps.what.outputs.chart_version }}.tgz" "oci://ghcr.io/$OWNER/helm"
+
+      - name: Forget the source
+        if: always()
+        run: rm -rf source dist
